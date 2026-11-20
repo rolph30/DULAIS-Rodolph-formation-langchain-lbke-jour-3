@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import contextlib
+import logging
 from typing import TypedDict
 from langgraph_sdk.runtime import ServerRuntime
 
@@ -59,6 +60,25 @@ def utc_now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
+logger = logging.getLogger(__name__)
+
+
+def mcp_servers() -> dict:
+    """Serveurs MCP auxquels l'agent se connecte.
+
+    - Une URL http(s) = serveur MCP distant
+    - Un Path = script local lancé en stdio
+    """
+    return {
+        # Documentation LangChain (guides, tutoriels)
+        "docs-langchain": "https://docs.langchain.com/mcp",
+        # Référence d'API (classes, méthodes, paramètres)
+        "reference-langchain": "https://reference.langchain.com/mcp",
+        # Script local FastMCP
+        "calculator": Path(__file__).resolve().with_name("mcp_calculator.py"),
+    }
+
+
 def make_agent(tools: list):
     return create_agent(
         model=model,  # DEFAULT_MODEL,
@@ -98,13 +118,23 @@ async def make_graph(runtime: ServerRuntime):
     # On utilise "Path" de pathlib car le MCPAdapter
     # le reconnaît automatiquement comme un fichier local
     # https://docs.langchain.com/oss/python/langchain/mcp#transports
-    mcp_script = Path(__file__).resolve().with_name("mcp_calculator.py")
     ert = runtime.execution_runtime
     if ert is None:
         # Appel d'introspection, on ne charge pas les outils MCP
         yield make_agent(tools=[])
     else:
-        # Exécution du graphe, on charge les outils MCP
-        async with MCPAdapter(mcp_script) as adapter:
-            mcp_tools = await adapter.list_tools()
-            yield make_agent(tools=[utc_now, *mcp_tools])
+        # Exécution du graphe : on se connecte à plusieurs serveurs MCP
+        # en même temps et on regroupe tous leurs outils.
+        tools = [utc_now]
+        async with contextlib.AsyncExitStack() as stack:
+            for name, target in mcp_servers().items():
+                try:
+                    adapter = await stack.enter_async_context(MCPAdapter(target))
+                    server_tools = await adapter.list_tools()
+                except Exception as exc:  # un serveur HS ne bloque pas les autres
+                    logger.warning("Serveur MCP '%s' ignoré : %s", name, exc)
+                    continue
+                logger.info(
+                    "Serveur MCP '%s' : %d outils", name, len(server_tools))
+                tools.extend(server_tools)
+            yield make_agent(tools=tools)
